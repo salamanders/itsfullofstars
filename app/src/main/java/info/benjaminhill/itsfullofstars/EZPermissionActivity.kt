@@ -17,6 +17,17 @@ abstract class EZPermissionActivity : AppCompatActivity() {
 
     final override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Don't ignore exceptions in coroutines https://github.com/Kotlin/kotlinx.coroutines/issues/148#issuecomment-338101986
+        val baseUEH = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            // this may double log the error on older versions of android
+            Log.severe("FATAL EXCEPTION: ${thread.name} $error")
+            Log.severe(error.stackTrace.joinToString("\n"))
+            baseUEH.uncaughtException(thread, error)
+            throw error
+        }
+
         if (missingPermissions.isEmpty()) {
             Log.info("Had all permissions the first time.")
             run()

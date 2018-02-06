@@ -10,18 +10,22 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
-import kotlinx.coroutines.experimental.CoroutineName
+import kotlinx.coroutines.experimental.CompletableDeferred
+import kotlinx.coroutines.experimental.Deferred
+import kotlinx.coroutines.experimental.async
 import kotlinx.coroutines.experimental.channels.Channel
-import kotlinx.coroutines.experimental.launch
+import kotlinx.coroutines.experimental.channels.actor
 import kotlinx.coroutines.experimental.runBlocking
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicLong
 import java.util.logging.Logger
 import kotlin.coroutines.experimental.suspendCoroutine
 
 
 /**
  * Simplest possible implementation of Android camera2
+ * Caller has to await click results before closing the camera.
  */
 class SimpleCamera(context: Context) : AutoCloseable {
 
@@ -30,9 +34,84 @@ class SimpleCamera(context: Context) : AutoCloseable {
     private val imageReader: ImageReader
     private lateinit var cameraDevice: CameraDevice
     private lateinit var cameraCaptureSession: CameraCaptureSession
-    private val totalCaptureResultChannel = Channel<TotalCaptureResult>(2)
-    private val latestImageChannel = Channel<Image>(2)
+    private val cameraSetup: Deferred<Unit>
 
+    open class CamActorMessage
+    class CamActorClick(val fileLocationResponse: CompletableDeferred<String>) : CamActorMessage()
+    class CamActorImage(val image: Image) : CamActorMessage()
+    class CamActorCaptureResult(val captureResult: TotalCaptureResult) : CamActorMessage()
+
+    /**
+     * Fan-in Actor that kicks off when a new image number comes along, and waits for all the supporting info
+     * (Image data, and optional captureResult for raw images)
+     * Unknown if this is a bad smell of wrapping everything into the same inbound channel then parsing it back out to queues
+     */
+    private val cameraClickSaver = actor<CamActorMessage>(capacity = CAM_CAPACITY) {
+        val imageCount = AtomicLong(0)
+        val openClicks = mutableMapOf<Long, CompletableDeferred<String>>()
+        val currentNumberChannel = Channel<Long>(CAM_CAPACITY)
+        val currentImageChannel = Channel<Image>(CAM_CAPACITY)
+        val currentCaptureResultChannel = Channel<TotalCaptureResult>(CAM_CAPACITY)
+
+        fun save(number: Long, image: Image, captureResult: TotalCaptureResult): Long {
+            when (image.format) {
+                ImageFormat.JPEG -> {
+                    Log.info("saving jpg image:$number")
+                    val buffer = image.planes[0].buffer
+                    val bytes = ByteArray(buffer.remaining())
+                    buffer.get(bytes)
+                    val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+                            "stars_%05d_%d.jpg".format(number, System.currentTimeMillis() / 1000))
+                    file.writeBytes(bytes)
+                    Log.info("Wrote image:$number ${file.canonicalPath} ${file.length() / 1024}k")
+                    openClicks[number]?.complete(file.canonicalPath)
+                }
+                ImageFormat.RAW_SENSOR -> {
+                    Log.info("saving dmg image:$number")
+                    val dngCreator = DngCreator(manager.getCameraCharacteristics(cameraDevice.id), captureResult)
+                    val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+                            "stars_%05d_%d.dmg".format(number, System.currentTimeMillis() / 1000))
+                    FileOutputStream(file).use { os ->
+                        dngCreator.writeImage(os, image)
+                    }
+                    Log.info("Wrote image:$number ${file.canonicalPath} ${file.length() / (1024 * 1024)}m")
+                    openClicks[number]?.complete(file.canonicalPath)
+                }
+                else -> {
+                    TODO("image:$number Unsupported image format: ${image.format}")
+                }
+            }
+            image.close()
+            return number
+        }
+
+        for (msg in channel) {
+            when (msg) {
+                is CamActorClick -> {
+                    val nextImageNumber = imageCount.getAndIncrement()
+                    currentNumberChannel.send(nextImageNumber)
+                    openClicks[nextImageNumber] = msg.fileLocationResponse
+                    Log.info("cameraClickSaver new click for image:$nextImageNumber")
+                }
+                is CamActorImage -> {
+                    currentImageChannel.send(msg.image)
+                    Log.info("cameraClickSaver got image")
+                }
+                is CamActorCaptureResult -> {
+                    currentCaptureResultChannel.send(msg.captureResult)
+                    Log.info("cameraClickSaver got captureResult")
+                }
+                else -> TODO("Unknown CamActorMessage")
+            }
+            Log.info("cameraClickSaver currentNumber:${currentNumberChannel.isEmpty} ; currentImage:${currentImageChannel.isEmpty} ; currentCaptureResult:${currentCaptureResultChannel.isEmpty}")
+            if (!currentNumberChannel.isEmpty && !currentImageChannel.isEmpty && !currentCaptureResultChannel.isEmpty) {
+                Log.info("cameraClickSaver has all three elements (yay!)")
+                openClicks.remove(save(currentNumberChannel.receive(), currentImageChannel.receive(), currentCaptureResultChannel.receive()))
+            }
+        }
+    }
+
+    /** Run everything possible in the background */
     private val backgroundHandler: Handler by lazy {
         val backgroundThread = HandlerThread("CameraBackground")
         backgroundThread.start()
@@ -40,7 +119,6 @@ class SimpleCamera(context: Context) : AutoCloseable {
     }
 
     init {
-
         mode = manager.cameraIdList.map { cameraId ->
             Mode(cameraId, manager)
         }.sortedDescending().first()
@@ -49,42 +127,49 @@ class SimpleCamera(context: Context) : AutoCloseable {
                 mode.size.width,
                 mode.size.height,
                 mode.imageFormat,
-                2
+                CAM_CAPACITY
         )
         imageReader.setOnImageAvailableListener({ imageReader ->
-            launch {
-                latestImageChannel.send(imageReader.acquireLatestImage())
+            runBlocking {
+                Log.info("setOnImageAvailableListener about to add image data to actor")
+                cameraClickSaver.send(CamActorImage(imageReader.acquireLatestImage()))
             }
         }, backgroundHandler)
 
-        runBlocking(CoroutineName("setupDeviceAndSession")) {
+        cameraSetup = async {
             cameraDevice = aOpen(mode.cameraId)
             Log.info("Camera device is open.")
-            cameraCaptureSession = cameraCaptureSession()
+            cameraCaptureSession = aCameraCaptureSession()
             Log.info("cameraCaptureSession is ready")
         }
+    }
 
-        launch(CoroutineName("channelToImageSavingLoop")) {
-            Log.info("Launching image saving loop")
-            while (!latestImageChannel.isClosedForSend || !latestImageChannel.isEmpty) {
-                Log.info("Waiting for image channels...")
-                save(latestImageChannel.receive(), totalCaptureResultChannel.receive())
+    override fun close() = runBlocking {
+        try {
+            // stop accepting new clicks
+            cameraDevice.close()
+            cameraClickSaver.close()
+            if (!cameraClickSaver.isClosedForSend) {
+                cameraClickSaver.close()
             }
-            Log.warning("Channels closed and empty")
+        } catch (e: Exception) {
+            Log.severe("Exception while closing SimpleCamera cameraDevice: $e")
+        }
+    }
+
+    fun click(): CompletableDeferred<String> {
+        if (!cameraSetup.isCompleted) {
+            runBlocking {
+                Log.info("Camera wasn't ready yet, why so eager?")
+                cameraSetup.await()
+            }
         }
 
-        Log.info("init finished")
-    }
-
-    override fun close() {
-        cameraDevice.close()
-        totalCaptureResultChannel.close()
-        latestImageChannel.close()
-    }
-
-    fun click() {
-        Log.info("click - start")
-
+        val saveLocation = CompletableDeferred<String>()
+        val nextClick = CamActorClick(saveLocation)
+        if (!cameraClickSaver.offer(nextClick)) {
+            throw Exception("Unable to click camera.")
+        }
         val captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
         captureRequestBuilder.addTarget(imageReader.surface)
 
@@ -96,54 +181,21 @@ class SimpleCamera(context: Context) : AutoCloseable {
         captureRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, 400)
         captureRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 100) // ms
         captureRequestBuilder.set(CaptureRequest.JPEG_QUALITY, 99.toByte())
-        // After this, hops to imageReader.setOnImageAvailableListener
-
         val captureRequest = captureRequestBuilder.build()
-        Log.info("Built captureRequest: ${captureRequest.describeContents()}")
-
         cameraCaptureSession.capture(captureRequest, object : CameraCaptureSession.CaptureCallback() {
-            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                if (!totalCaptureResultChannel.offer(result)) {
-                    Log.warning("Problem while sending captureResult to the channel")
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, tcr: TotalCaptureResult) {
+                runBlocking {
+                    cameraClickSaver.send(CamActorCaptureResult(tcr))
                 }
+
             }
         }, backgroundHandler)
-        Log.info("click - end")
+        // After this, hops to imageReader.setOnImageAvailableListener
+        return saveLocation
     }
-
-    /**
-     * Generic image saver (lossy or lossless)
-     * will use lastCaptureResult for raw images
-     */
-    private fun save(image: Image, captureResult: CaptureResult) = when (image.format) {
-        ImageFormat.JPEG -> {
-            Log.info("saving jpg")
-            val buffer = image.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-            val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
-                    "stars_${System.currentTimeMillis() / 1000}.jpg")
-            file.writeBytes(bytes)
-            Log.info("Wrote ${file.canonicalPath} ${file.length() / (1024 * 1024)}m")
-
-        }
-        ImageFormat.RAW_SENSOR -> {
-            val dngCreator = DngCreator(manager.getCameraCharacteristics(cameraDevice.id), captureResult)
-            val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
-                    "stars_${System.currentTimeMillis()}.dmg")
-            FileOutputStream(file).use { os ->
-                dngCreator.writeImage(os, image)
-            }
-            Log.info("Wrote ${file.canonicalPath} ${file.length() / (1024 * 1024)}m")
-        }
-        else -> {
-            TODO("Unsupported image format: ${image.format}")
-        }
-    }
-
 
     /** Blocking session creator */
-    private suspend fun cameraCaptureSession(): CameraCaptureSession = suspendCoroutine { cont ->
+    private suspend fun aCameraCaptureSession(): CameraCaptureSession = suspendCoroutine { cont ->
         cameraDevice.createCaptureSession(listOf(imageReader.surface), object : CameraCaptureSession.StateCallback() {
             override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) =
                     cont.resumeWithException(IllegalArgumentException("Unable to configure cameraCaptureSession"))
@@ -199,12 +251,12 @@ class SimpleCamera(context: Context) : AutoCloseable {
                 ?: Size(0, 0)
 
         /**
-         * prioritizes higher resolution, lens back over front, JPEG over RAW_SENSOR
+         * prioritizes higher resolution, lens back over front, RAW_SENSOR over JPEG
          * TODO: return to using RAW
          */
         override fun compareTo(other: Mode): Int = when {
             size != other.size -> (size.height * size.width) - (other.size.height * other.size.width)
-            imageFormat != other.imageFormat -> if (imageFormat == ImageFormat.JPEG) 1 else -1
+            imageFormat != other.imageFormat -> if (imageFormat == ImageFormat.RAW_SENSOR) 1 else -1
             lensFacing != other.lensFacing -> if (lensFacing == CameraCharacteristics.LENS_FACING_BACK) 1 else -1
             else -> cameraId.compareTo(other.cameraId)
         }
@@ -215,6 +267,7 @@ class SimpleCamera(context: Context) : AutoCloseable {
 
     companion object {
         private val Log = Logger.getLogger(SimpleCamera::class.java.simpleName)
+        private const val CAM_CAPACITY = 5
     }
 
 }

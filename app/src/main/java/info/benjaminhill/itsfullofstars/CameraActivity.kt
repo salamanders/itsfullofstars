@@ -3,6 +3,8 @@ package info.benjaminhill.itsfullofstars
 import android.Manifest
 import android.view.Menu
 import android.view.MenuItem
+import kotlinx.coroutines.experimental.Deferred
+import kotlinx.coroutines.experimental.runBlocking
 import java.util.logging.Logger
 
 
@@ -30,10 +32,22 @@ class CameraActivity : EZPermissionActivity() {
         SimpleCamera(this).use { c2s ->
             Log.info("Ready to take a shot in camera Mode: ${c2s.mode}")
             try {
-                c2s.click()
+                val clicks = mutableSetOf<Deferred<String>>()
+                for (i in 1..4) {
+                    clicks.add(c2s.click())
+                }
+                Log.severe("CLICKED A BUNCH OF TIMES")
+
+                Log.severe("WAITING FOR FIRST 2")
+                runBlocking {
+                    clicks.take(2).forEach {
+                        Log.severe(it.await())
+                    }
+                }
+                Log.severe("SAVED FIRST")
             } catch (e: Throwable) {
                 Log.severe("Died during click: $e")
-                e.printStackTrace()
+                Log.severe(e.stackTrace.joinToString("\n"))
             }
         }
     }
