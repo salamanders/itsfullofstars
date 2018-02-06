@@ -10,12 +10,9 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
-import kotlinx.coroutines.experimental.CompletableDeferred
-import kotlinx.coroutines.experimental.Deferred
-import kotlinx.coroutines.experimental.async
+import kotlinx.coroutines.experimental.*
 import kotlinx.coroutines.experimental.channels.Channel
 import kotlinx.coroutines.experimental.channels.actor
-import kotlinx.coroutines.experimental.runBlocking
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicLong
@@ -40,7 +37,7 @@ class SimpleCamera(context: Context) : AutoCloseable {
     private val imageReader: ImageReader
     private lateinit var cameraDevice: CameraDevice
     private lateinit var cameraCaptureSession: CameraCaptureSession
-    private val cameraSetup: Deferred<Unit> // in case focusing takes a few seconds.  TODO: listen to ready events
+    private val cameraSetup: Deferred<Unit> // in case focusing takes a few seconds.
 
     interface CamActorMessage
     class CamActorClick(val fileLocationResponse: CompletableDeferred<String>) : CamActorMessage
@@ -49,9 +46,9 @@ class SimpleCamera(context: Context) : AutoCloseable {
 
     /**
      * Fan-in Actor that kicks off when a new image number comes along, and waits for all the supporting info
-     * TODO if this is a bad smell of wrapping everything into the same inbound channel then parsing it back out to queues
+     * TODO bad smell of wrapping everything into the same inbound channel then parsing it back out to queues
      */
-    private val cameraClickSaver = actor<CamActorMessage>(capacity = CAM_CAPACITY) {
+    private val cameraClickSaver = actor<CamActorMessage>(capacity = CAM_CAPACITY * 3) {
         val imageCount = AtomicLong(0)
         val openClicks = mutableMapOf<Long, CompletableDeferred<String>>()
         val currentNumberChannel = Channel<Long>(CAM_CAPACITY)
@@ -63,7 +60,7 @@ class SimpleCamera(context: Context) : AutoCloseable {
                     "stars_%05d_%d".format(number, System.currentTimeMillis() / 1000)).toString()
             val file: File = when (image.format) {
                 ImageFormat.JPEG -> {
-                    Log.info("saving jpg image:$number")
+                    Log.fine("saving jpg image:$number")
                     val buffer = image.planes[0].buffer
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
@@ -73,7 +70,7 @@ class SimpleCamera(context: Context) : AutoCloseable {
                     file
                 }
                 ImageFormat.RAW_SENSOR -> {
-                    Log.info("saving dmg image:$number")
+                    Log.fine("saving dmg image:$number")
                     val dngCreator = DngCreator(manager.getCameraCharacteristics(cameraDevice.id), captureResult)
                     val file = File("$fileWithoutExtension.dmg")
                     FileOutputStream(file).use { os ->
@@ -87,7 +84,7 @@ class SimpleCamera(context: Context) : AutoCloseable {
                 }
             }
             Log.info("Wrote image:${file.canonicalPath} ${file.length() / 1024}k")
-            image.close()
+            image.close() // necessary when taking a few shots
             return number
         }
 
@@ -97,21 +94,21 @@ class SimpleCamera(context: Context) : AutoCloseable {
                     val nextImageNumber = imageCount.getAndIncrement()
                     currentNumberChannel.send(nextImageNumber)
                     openClicks[nextImageNumber] = msg.fileLocationResponse
-                    Log.info("cameraClickSaver new click for image:$nextImageNumber")
+                    Log.fine("cameraClickSaver new click for image:$nextImageNumber")
                 }
                 is CamActorImage -> {
                     currentImageChannel.send(msg.image)
-                    Log.info("cameraClickSaver got image")
+                    Log.fine("cameraClickSaver got image")
                 }
                 is CamActorCaptureResult -> {
                     currentCaptureResultChannel.send(msg.captureResult)
-                    Log.info("cameraClickSaver got captureResult")
+                    Log.fine("cameraClickSaver got captureResult")
                 }
                 else -> TODO("Unknown CamActorMessage")
             }
-            Log.info("cameraClickSaver currentNumber:${currentNumberChannel.isEmpty} ; currentImage:${currentImageChannel.isEmpty} ; currentCaptureResult:${currentCaptureResultChannel.isEmpty}")
+            Log.fine("cameraClickSaver currentNumber:${currentNumberChannel.isEmpty} ; currentImage:${currentImageChannel.isEmpty} ; currentCaptureResult:${currentCaptureResultChannel.isEmpty}")
             if (!currentNumberChannel.isEmpty && !currentImageChannel.isEmpty && !currentCaptureResultChannel.isEmpty) {
-                Log.info("cameraClickSaver has all three elements (yay!)")
+                Log.fine("cameraClickSaver has all three elements (yay!)")
                 openClicks.remove(save(currentNumberChannel.receive(), currentImageChannel.receive(), currentCaptureResultChannel.receive()))
             }
         }
@@ -126,6 +123,7 @@ class SimpleCamera(context: Context) : AutoCloseable {
 
     init {
         mode = manager.cameraIdList.map { cameraId ->
+            // TODO: return to using RAW
             Mode(cameraId, manager, rawIsBest = false)
         }.sortedDescending().first()
 
@@ -137,16 +135,19 @@ class SimpleCamera(context: Context) : AutoCloseable {
         )
         imageReader.setOnImageAvailableListener({ imageReader ->
             runBlocking {
-                Log.info("setOnImageAvailableListener about to add image data to actor")
+                Log.fine("setOnImageAvailableListener about to add image data to actor")
                 cameraClickSaver.send(CamActorImage(imageReader.acquireLatestImage()))
             }
         }, backgroundHandler)
 
         cameraSetup = async {
             cameraDevice = aOpen(mode.cameraId)
-            Log.info("Camera device is open.")
+            Log.fine("Camera device is open.")
             cameraCaptureSession = aCameraCaptureSession()
-            Log.info("cameraCaptureSession is ready")
+            Log.fine("cameraCaptureSession is ready")
+            delay(1000) // Wait for camera to stabilize.
+            // TODO: better callback https://github.com/googlesamples/android-Camera2Basic/blob/master/kotlinApp/Application/src/main/java/com/example/android/camera2basic/Camera2BasicFragment.kt#L229
+            Log.fine("Waited 1 second for stable camera.")
         }
     }
 
@@ -154,20 +155,21 @@ class SimpleCamera(context: Context) : AutoCloseable {
         try {
             // stop accepting new clicks
             cameraDevice.close()
-            cameraClickSaver.close()
-            if (!cameraClickSaver.isClosedForSend) {
-                cameraClickSaver.close()
-            }
         } catch (e: Exception) {
             Log.severe("Exception while closing SimpleCamera cameraDevice: $e")
+        }
+        if (!cameraClickSaver.isClosedForSend) {
+            cameraClickSaver.close()
+            Log.fine("cameraClickSaver closed")
         }
     }
 
     fun click(): CompletableDeferred<String> {
         if (!cameraSetup.isCompleted) {
             runBlocking {
-                Log.info("Camera wasn't ready yet, why so eager?")
+                Log.warning("Camera wasn't ready yet, why so eager?")
                 cameraSetup.await()
+                Log.info("Ok, now things are ready, you may continue.")
             }
         }
 
@@ -179,14 +181,18 @@ class SimpleCamera(context: Context) : AutoCloseable {
         val captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
         captureRequestBuilder.addTarget(imageReader.surface)
 
+        captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+
+        /*
+        captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_OFF)
         captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
         captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-        captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_OFF)
 
         captureRequestBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f) // infinity
         captureRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, 400) // should at least get an image
         captureRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 100) // ms
         captureRequestBuilder.set(CaptureRequest.JPEG_QUALITY, 99.toByte()) // because 100 is silly
+        */
         val captureRequest = captureRequestBuilder.build()
         cameraCaptureSession.capture(captureRequest, object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, tcr: TotalCaptureResult) {
@@ -262,7 +268,6 @@ class SimpleCamera(context: Context) : AutoCloseable {
 
         /**
          * prioritizes higher resolution, lens back over front, RAW_SENSOR over JPEG
-         * TODO: return to using RAW
          */
         override fun compareTo(other: Mode): Int = when {
             size != other.size -> (size.height * size.width) - (other.size.height * other.size.width)

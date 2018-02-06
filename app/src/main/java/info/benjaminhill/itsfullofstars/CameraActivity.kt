@@ -33,7 +33,7 @@ class CameraActivity : EZPermissionActivity() {
             Log.info("Ready to take a shot in camera Mode: ${c2s.mode}")
             try {
                 val clicks = mutableSetOf<Deferred<String>>()
-                for (i in 1..4) {
+                for (i in 0..3) {
                     clicks.add(c2s.click())
                 }
                 Log.severe("CLICKED A BUNCH OF TIMES")
@@ -44,7 +44,18 @@ class CameraActivity : EZPermissionActivity() {
                         Log.severe(it.await())
                     }
                 }
-                Log.severe("SAVED FIRST")
+                Log.severe("SAVED FIRST 2")
+                clicks.add(c2s.click())
+
+                runBlocking {
+                    Log.severe("SAVING THE REST")
+                    clicks.forEach {
+                        it.await()
+                    }
+                }
+
+                Log.severe("THROWAWAY CLICK")
+                clicks.add(c2s.click())
             } catch (e: Throwable) {
                 Log.severe("Died during click: $e")
                 Log.severe(e.stackTrace.joinToString("\n"))
