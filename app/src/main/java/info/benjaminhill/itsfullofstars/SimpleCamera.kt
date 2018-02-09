@@ -10,6 +10,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
+import android.view.SurfaceView
 import kotlinx.coroutines.experimental.*
 import kotlinx.coroutines.experimental.channels.Channel
 import kotlinx.coroutines.experimental.channels.actor
@@ -22,15 +23,15 @@ import kotlin.coroutines.experimental.suspendCoroutine
 
 /**
  * Attempt at the simplest possible implementation of Android camera2
- * Caller has to await click results before closing the camera.
- * Every click responds with a CompletableDeferred<String> of the save location
+ * Every click responds with a CompletableDeferred<String> of the save location, up to the caller to await before closing the camera
+ *
  * <code>
  * SimpleCamera(this).use { c2s ->
  *   runBlocking { println(c2s.click().await()) }
  * }
  * </code>
  */
-class SimpleCamera(context: Context) : AutoCloseable {
+class SimpleCamera(context: Context, csv: SurfaceView) : AutoCloseable {
 
     val mode: Mode // Sorted by best resolution, rear-facing
     private val manager: CameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -38,6 +39,50 @@ class SimpleCamera(context: Context) : AutoCloseable {
     private lateinit var cameraDevice: CameraDevice
     private lateinit var cameraCaptureSession: CameraCaptureSession
     private val cameraSetup: Deferred<Unit> // in case focusing takes a few seconds.
+    /** Run everything possible in the background */
+    private val backgroundHandler: Handler
+
+    init {
+        val backgroundThread = HandlerThread("CameraBackground")
+        backgroundThread.start()
+        backgroundHandler = Handler(backgroundThread.looper)
+
+        mode = manager.cameraIdList.map { cameraId ->
+            // TODO: return to using RAW
+            Mode(cameraId, manager, rawIsBest = false)
+        }.sortedDescending().first()
+
+        imageReader = ImageReader.newInstance(
+                mode.size.width,
+                mode.size.height,
+                mode.imageFormat,
+                CAM_CAPACITY
+        )
+        imageReader.setOnImageAvailableListener({ imageReader ->
+            runBlocking {
+                Log.fine("setOnImageAvailableListener about to add image data to actor")
+                cameraClickSaver.send(CamActorImage(imageReader.acquireLatestImage()))
+            }
+        }, backgroundHandler)
+
+        cameraSetup = async {
+            cameraDevice = aOpen(mode.cameraId)
+            Log.fine("Camera device is open.")
+            cameraCaptureSession = aCameraCaptureSession()
+            Log.fine("cameraCaptureSession is ready")
+            delay(1000) // Wait for camera to stabilize.
+            // TODO: better callback https://github.com/googlesamples/android-Camera2Basic/blob/master/kotlinApp/Application/src/main/java/com/example/android/camera2basic/Camera2BasicFragment.kt#L229
+            Log.fine("Waited 1 second for stable camera.")
+            csv.holder
+
+
+            mSurfaceView.getHolder().addCallback(mSurfaceHolderCallback)
+            setContentView(mSurfaceView)
+
+
+        }
+    }
+
 
     interface CamActorMessage
     class CamActorClick(val fileLocationResponse: CompletableDeferred<String>) : CamActorMessage
@@ -111,43 +156,6 @@ class SimpleCamera(context: Context) : AutoCloseable {
                 Log.fine("cameraClickSaver has all three elements (yay!)")
                 openClicks.remove(save(currentNumberChannel.receive(), currentImageChannel.receive(), currentCaptureResultChannel.receive()))
             }
-        }
-    }
-
-    /** Run everything possible in the background */
-    private val backgroundHandler: Handler by lazy {
-        val backgroundThread = HandlerThread("CameraBackground")
-        backgroundThread.start()
-        Handler(backgroundThread.looper)
-    }
-
-    init {
-        mode = manager.cameraIdList.map { cameraId ->
-            // TODO: return to using RAW
-            Mode(cameraId, manager, rawIsBest = false)
-        }.sortedDescending().first()
-
-        imageReader = ImageReader.newInstance(
-                mode.size.width,
-                mode.size.height,
-                mode.imageFormat,
-                CAM_CAPACITY
-        )
-        imageReader.setOnImageAvailableListener({ imageReader ->
-            runBlocking {
-                Log.fine("setOnImageAvailableListener about to add image data to actor")
-                cameraClickSaver.send(CamActorImage(imageReader.acquireLatestImage()))
-            }
-        }, backgroundHandler)
-
-        cameraSetup = async {
-            cameraDevice = aOpen(mode.cameraId)
-            Log.fine("Camera device is open.")
-            cameraCaptureSession = aCameraCaptureSession()
-            Log.fine("cameraCaptureSession is ready")
-            delay(1000) // Wait for camera to stabilize.
-            // TODO: better callback https://github.com/googlesamples/android-Camera2Basic/blob/master/kotlinApp/Application/src/main/java/com/example/android/camera2basic/Camera2BasicFragment.kt#L229
-            Log.fine("Waited 1 second for stable camera.")
         }
     }
 
@@ -284,7 +292,6 @@ class SimpleCamera(context: Context) : AutoCloseable {
         private val Log = Logger.getLogger(SimpleCamera::class.java.simpleName)
         private const val CAM_CAPACITY = 5
     }
-
 }
 
 

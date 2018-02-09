@@ -1,26 +1,20 @@
 package info.benjaminhill.itsfullofstars
 
-import android.Manifest
+
 import android.view.Menu
 import android.view.MenuItem
+import kotlinx.android.synthetic.main.activity_camera.*
 import kotlinx.coroutines.experimental.Deferred
 import kotlinx.coroutines.experimental.runBlocking
 import java.util.logging.Logger
 
 
 class CameraActivity : EZPermissionActivity() {
-    init {
-        requiredPermissions.addAll(setOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.READ_EXTERNAL_STORAGE,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE))
-    }
+
 
     override fun run() {
         System.setProperty("kotlinx.coroutines.debug", "")
-
         setContentView(R.layout.activity_camera)
-
         /*
         setSupportActionBar(toolbar)
 
@@ -29,7 +23,7 @@ class CameraActivity : EZPermissionActivity() {
                     .setAction("Action", null).show()
         }
         */
-        SimpleCamera(this).use { c2s ->
+        SimpleCamera(this, cameraSurfaceView).use { c2s ->
             Log.info("Ready to take a shot in camera Mode: ${c2s.mode}")
             try {
                 val clicks = mutableSetOf<Deferred<String>>()
