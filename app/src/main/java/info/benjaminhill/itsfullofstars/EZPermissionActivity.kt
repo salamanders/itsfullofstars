@@ -1,67 +1,78 @@
 package info.benjaminhill.itsfullofstars
 
 import android.content.pm.PackageManager
-import android.content.pm.PermissionInfo
 import android.os.Bundle
 import android.support.v4.app.ActivityCompat
 import android.support.v4.content.ContextCompat
 import android.support.v7.app.AppCompatActivity
+import android.util.Log
 import android.widget.Toast
-import java.util.logging.Logger
 
 /**
- * Work out the dangerous permissions (dynamically) before diving into the app
+ * Work out the dangerous permissions listed in the AndroidManifest.xml (dynamically) before diving into the app `runWithPermissions { yourCode }`
  * TODO: Should this be a headless fragment?
  */
 abstract class EZPermissionActivity : AppCompatActivity() {
-    abstract fun run()
 
-    final override fun onCreate(savedInstanceState: Bundle?) {
+    private lateinit var permissionCallback: () -> Unit
+
+    override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // Don't ignore exceptions in coroutines https://github.com/Kotlin/kotlinx.coroutines/issues/148#issuecomment-338101986
         val baseUEH = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             // this may double log the error on older versions of android
-            Log.severe("FATAL EXCEPTION: ${thread.name} $error")
-            Log.severe(error.stackTrace.joinToString("\n"))
+            Log.w(TAG, "FATAL EXCEPTION: ${thread.name} $error")
+            Log.w(TAG, error)
             baseUEH.uncaughtException(thread, error)
             throw error
         }
+    }
 
-        if (missingPermissions.isEmpty()) {
-            Log.info("We already had all the dangerous permissions we needed (yay!)")
-            run()
-        }
-
+    protected fun runWithPermissions(f: () -> Unit) = if (missingPermissions.isEmpty()) {
+        Log.i(TAG, "We already have all the permissions (${requiredPermissions.joinToString()}) we needed, running directly")
+        f()
+    } else {
         // TODO: The "right" way with requesting permissions giving reasons
-        Log.info("Requesting dangerous permission to $missingPermissions.")
-        ActivityCompat.requestPermissions(this, missingPermissions, SIMPLE_PERMISSION_ID)
+        Log.i(TAG, "Requesting permissions, be back soon.")
+        logPermissions()
+        permissionCallback = f
+        ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), SIMPLE_PERMISSION_ID)
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, grantPermissions: Array<out String>, grantResults: IntArray) {
-        if (requestCode == SIMPLE_PERMISSION_ID) {
-            Log.info("Permission grant result: ${grantPermissions.joinToString()}=${grantResults.joinToString()}")
-            if (missingPermissions.isEmpty()) {
-                Log.info("User granted all permissions!")
-                run()
+    override fun onRequestPermissionsResult(requestCode: Int, grantPermissions: Array<out String>, grantResults: IntArray) =
+            if (requestCode == SIMPLE_PERMISSION_ID) {
+                Log.i(TAG, "Permission grant result: ${grantPermissions.joinToString()}=${grantResults.joinToString()}")
+                logPermissions()
+                if (missingPermissions.isEmpty()) {
+                    Log.i(TAG, "User granted all permissions that we requested.")
+                    permissionCallback()
+                } else {
+                    Log.w(TAG, "User declined required permissions: ${missingPermissions.joinToString()}")
+                    Toast.makeText(this, "Please restart the app after allowing access to: ${missingPermissions.joinToString()}", Toast.LENGTH_LONG).show()
+                }
             } else {
-                Toast.makeText(this, "You must allow access to the camera and to write to external storage.", Toast.LENGTH_LONG).show()
-                TODO("Still missing permissions.  :(")
+                super.onRequestPermissionsResult(requestCode, grantPermissions, grantResults)
             }
-        } else {
-            super.onRequestPermissionsResult(requestCode, grantPermissions, grantResults)
+
+    private fun logPermissions() {
+        requiredPermissions.forEach {
+            Log.i(TAG, "Permission: $it; missing: ${it in missingPermissions}")
         }
     }
 
-    private val missingPermissions: Array<String>
+    private val requiredPermissions
         get() = packageManager.getPackageInfo(packageName, PackageManager.GET_PERMISSIONS).requestedPermissions
+                .toSet()
+
+    private val missingPermissions
+        get() = requiredPermissions
                 .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-                .filter { packageManager.getPermissionInfo(it, PackageManager.GET_META_DATA).protectionLevel == PermissionInfo.PROTECTION_DANGEROUS }
-                .toTypedArray()
+                .toSet()
 
     companion object {
-        const val SIMPLE_PERMISSION_ID = 42
-        private val Log = Logger.getLogger(EZPermissionActivity::class.java.simpleName)
+        private const val SIMPLE_PERMISSION_ID = 42
+        private const val TAG = "ifos"
     }
 }

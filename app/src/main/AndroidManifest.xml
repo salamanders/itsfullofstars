@@ -15,7 +15,7 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
-            android:name=".CameraActivity"
+            android:name=".SimpleCameraActivity"
             android:label="@string/app_name"
             android:configChanges="orientation|screenSize"
             android:theme="@style/AppTheme.NoActionBar">
