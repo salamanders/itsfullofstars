@@ -9,8 +9,8 @@ import android.util.Log
 import android.widget.Toast
 
 /**
- * Work out the dangerous permissions listed in the AndroidManifest.xml (dynamically) before diving into the app `runWithPermissions { yourCode }`
- * TODO: Should this be a headless fragment?
+ * Work out the dangerous permissions listed in the AndroidManifest.xml (dynamically)
+ * before diving into the app: `runAfterAllPermissionsGranted { yourCode }`
  */
 abstract class EZPermissionActivity : AppCompatActivity() {
 
@@ -30,11 +30,12 @@ abstract class EZPermissionActivity : AppCompatActivity() {
         }
     }
 
-    protected fun runWithPermissions(f: () -> Unit) = if (missingPermissions.isEmpty()) {
+    /** Protect your code with this block */
+    protected fun runAfterAllPermissionsGranted(f: () -> Unit) = if (missingPermissions.isEmpty()) {
         Log.i(TAG, "We already have all the permissions (${requiredPermissions.joinToString()}) we needed, running directly")
         f()
     } else {
-        // TODO: The "right" way with requesting permissions giving reasons
+        // This is a prototype so we skip the right way to do permissions (with reasons given first, fallback plan, etc)
         Log.i(TAG, "Requesting permissions, be back soon.")
         logPermissions()
         permissionCallback = f
@@ -56,10 +57,8 @@ abstract class EZPermissionActivity : AppCompatActivity() {
                 super.onRequestPermissionsResult(requestCode, grantPermissions, grantResults)
             }
 
-    private fun logPermissions() {
-        requiredPermissions.forEach {
-            Log.i(TAG, "Permission: $it; missing: ${it in missingPermissions}")
-        }
+    private fun logPermissions() = requiredPermissions.forEach {
+        Log.i(TAG, "Permission: $it; missing: ${it in missingPermissions}")
     }
 
     private val requiredPermissions
